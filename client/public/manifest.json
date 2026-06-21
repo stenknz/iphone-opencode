@@ -1,0 +1,10 @@
+{
+  "name": "OpenCode iPhone",
+  "short_name": "OpenCode",
+  "description": "iPhone companion for OpenCode on Windows",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "icons": []
+}
