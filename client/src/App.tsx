@@ -13,6 +13,27 @@ interface TermLine {
   duration?: number;
 }
 
+interface ToastNotif {
+  id: number;
+  type: 'info' | 'error' | 'success';
+  message: string;
+}
+
+interface SearchResult {
+  path: string;
+  line: number;
+  content: string;
+}
+
+interface Session {
+  sessionId: string;
+  connectedAt: string;
+  lastActivityAt: string;
+  disconnectedAt: string | null;
+  project: string;
+  commandCount: number;
+}
+
 // ponytail: one component, no router, no state library
 export default function App() {
   const [token, setToken] = useState('');
@@ -27,9 +48,27 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
+  const recognitionRef = useRef<any>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // notification state
+  const [notifications, setNotifications] = useState<ToastNotif[]>([]);
+
+  // voice state
+  const [listening, setListening] = useState(false);
+
+  // search state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searchPending, setSearchPending] = useState(false);
+  const [searchTotal, setSearchTotal] = useState(0);
+
+  // session history state
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
 
   // file browser state
-  const [view, setView] = useState<'chat' | 'files' | 'file-view' | 'terminal'>('chat');
+  const [view, setView] = useState<'chat' | 'files' | 'file-view' | 'terminal' | 'history'>('chat');
   const [filePath, setFilePath] = useState('');
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [fileViewPath, setFileViewPath] = useState('');
@@ -38,6 +77,12 @@ export default function App() {
   const [editContent, setEditContent] = useState('');
   const [loading, setLoading] = useState(false);
   const [fileError, setFileError] = useState('');
+
+  // approval state
+  const [pendingApproval, setPendingApproval] = useState<{ approvalId: string; path: string; size: number; timestamp: string } | null>(null);
+  const [requestingApproval, setRequestingApproval] = useState(false);
+  const [approvalWaiting, setApprovalWaiting] = useState(false);
+  const pendingContentRef = useRef('');
 
   // terminal state
   const [termOutput, setTermOutput] = useState<TermLine[]>([]);
@@ -107,6 +152,23 @@ export default function App() {
           setTermRunning(false);
         } else if (env.type === 'history') {
           setTermHistory(env.payload as string[]);
+        } else if (env.type === 'approval_request') {
+          const p = env.payload as { approvalId: string; path: string; size: number; timestamp: string };
+          setPendingApproval(p);
+        } else if (env.type === 'approval_result') {
+          const p = env.payload as { approvalId: string; status: string };
+          setPendingApproval(null);
+          setRequestingApproval(false);
+          setApprovalWaiting(false);
+          if (p.status === 'written') {
+            setFileContent(pendingContentRef.current);
+            setEditing(false);
+            addNotification('success', 'File saved successfully');
+          } else if (p.status === 'rejected') {
+            addNotification('error', 'File save was rejected');
+          } else if (p.status === 'timed_out') {
+            addNotification('error', 'File save timed out');
+          }
         } else {
           setMessages(m => [...m, env]);
         }
@@ -124,6 +186,30 @@ export default function App() {
       wsRef.current?.close();
     };
   }, []);
+
+  // ponytail: poll server for notifications every 5s
+  useEffect(() => {
+    if (!authed || !token) return;
+    const check = async () => {
+      try {
+        const res = await fetch('http://localhost:3001/api/v1/notifications?sessionId=' + token, {
+          headers: authHeaders(),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data)) {
+            data.forEach((n: { type: string; message: string }) => {
+              const id = Date.now() + Math.random();
+              setNotifications(prev => [...prev, { id, type: n.type as ToastNotif['type'], message: n.message }]);
+              setTimeout(() => setNotifications(prev => prev.filter(x => x.id !== id)), 4000);
+            });
+          }
+        }
+      } catch { /* server not ready yet */ }
+    };
+    const interval = setInterval(check, 5000);
+    return () => clearInterval(interval);
+  }, [authed, token]);
 
   const send = () => {
     if (!input.trim() || !wsRef.current) return;
@@ -147,8 +233,148 @@ export default function App() {
     wsRef.current?.send(JSON.stringify({ type: 'kill' }));
   };
 
+  const handleApproval = (approved: boolean) => {
+    if (!pendingApproval) return;
+    setApprovalWaiting(true);
+    wsRef.current?.send(JSON.stringify({ type: 'approval', payload: { approvalId: pendingApproval.approvalId, approved } }));
+  };
+
+  const formatSize = (bytes: number) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
   const fetchHistory = () => {
     wsRef.current?.send(JSON.stringify({ type: 'history' }));
+  };
+
+  // notification helpers
+  const addNotification = (type: ToastNotif['type'], message: string) => {
+    const id = Date.now() + Math.random();
+    setNotifications(prev => [...prev, { id, type, message }]);
+    setTimeout(() => setNotifications(prev => prev.filter(n => n.id !== id)), 4000);
+  };
+
+  // voice-to-text
+  const toggleListening = () => {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return; // ponytail: Chrome/Safari only
+    if (listening) {
+      recognitionRef.current?.stop();
+      setListening(false);
+      return;
+    }
+    const recognition = new SR();
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    recognition.onresult = (e: any) => {
+      let transcript = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          transcript += e.results[i][0].transcript;
+        }
+      }
+      if (transcript) setInput(prev => prev + transcript);
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = setTimeout(() => recognition.stop(), 5000);
+    };
+    recognition.onend = () => {
+      setListening(false);
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    };
+    recognition.onerror = () => { setListening(false); };
+    recognition.start();
+    recognitionRef.current = recognition;
+    setListening(true);
+  };
+
+  // search files
+  const searchFiles = async () => {
+    if (!searchQuery.trim()) return;
+    setSearchPending(true);
+    setFileError('');
+    try {
+      const res = await fetch('http://localhost:3001/api/v1/files/search', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ query: searchQuery, path: filePath }),
+      });
+      if (!res.ok) { const t = await res.text(); throw new Error(t || 'Search failed'); }
+      const data = await res.json();
+      setSearchResults(data.results);
+      setSearchTotal(data.total);
+    } catch (e) {
+      setFileError((e as Error).message);
+    } finally {
+      setSearchPending(false);
+    }
+  };
+
+  const clearSearch = () => {
+    setSearchQuery('');
+    setSearchResults(null);
+    setSearchTotal(0);
+  };
+
+  const openSearchResult = async (path: string) => {
+    setFileViewPath(path);
+    setLoading(true);
+    setFileError('');
+    try {
+      const res = await fetch(
+        'http://localhost:3001/api/v1/files/read?path=' + encodeURIComponent(path),
+        { headers: authHeaders() },
+      );
+      if (!res.ok) { const t = await res.text(); throw new Error(t || 'Failed to read file'); }
+      const data = await res.json();
+      setFileContent(data.content);
+      setEditContent(data.content);
+      setEditing(false);
+      setView('file-view');
+    } catch (e) {
+      setFileError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // sessions
+  const fetchSessions = async () => {
+    setSessionsLoading(true);
+    try {
+      const res = await fetch('http://localhost:3001/api/v1/sessions/history', {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSessions(data);
+      }
+    } catch { /* server not ready */ }
+    setSessionsLoading(false);
+  };
+
+  const relativeTime = (dateStr: string) => {
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + 'm ago';
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    return Math.floor(hours / 24) + 'd ago';
+  };
+
+  const formatDuration = (connectedAt: string, disconnectedAt: string | null) => {
+    if (!disconnectedAt) return null;
+    const diff = new Date(disconnectedAt).getTime() - new Date(connectedAt).getTime();
+    const mins = Math.floor(diff / 60000);
+    const secs = Math.floor((diff % 60000) / 1000);
+    if (mins < 1) return secs + 's';
+    if (mins < 60) return mins + 'm ' + secs + 's';
+    const hours = Math.floor(mins / 60);
+    return hours + 'h ' + (mins % 60) + 'm';
   };
 
   // file browser functions
@@ -202,6 +428,7 @@ export default function App() {
   const saveFile = async () => {
     setLoading(true);
     setFileError('');
+    pendingContentRef.current = editContent;
     try {
       const res = await fetch(
         `http://localhost:3001/api/v1/files/write?path=${encodeURIComponent(fileViewPath)}`,
@@ -212,8 +439,14 @@ export default function App() {
         },
       );
       if (!res.ok) { const t = await res.text(); throw new Error(t || 'Failed to save file'); }
-      setFileContent(editContent);
-      setEditing(false);
+      const data = await res.json();
+      if (data.status === 'pending_approval') {
+        setRequestingApproval(true);
+        addNotification('info', 'Requesting server approval…');
+      } else {
+        setFileContent(editContent);
+        setEditing(false);
+      }
     } catch (e) {
       setFileError((e as Error).message);
     } finally {
@@ -258,6 +491,7 @@ export default function App() {
   };
 
   // ponytail: dirs first, then alphabetical
+  const hasSpeech = typeof window !== 'undefined' && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
   const sortedEntries = [...entries].sort((a, b) => {
     if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
     return a.name.localeCompare(b.name);
@@ -298,6 +532,7 @@ export default function App() {
             <button className={`tab${view === 'chat' ? ' active' : ''}`} onClick={() => setView('chat')}>Chat</button>
             <button className={`tab${view === 'files' || view === 'file-view' ? ' active' : ''}`} onClick={switchToFiles}>Files</button>
             <button className={`tab${view === 'terminal' ? ' active' : ''}`} onClick={() => { setView('terminal'); if (!historyFetchedRef.current) { historyFetchedRef.current = true; fetchHistory(); } }}>Terminal</button>
+            <button className={`tab${view === 'history' ? ' active' : ''}`} onClick={() => { setView('history'); fetchSessions(); }}>History</button>
           </nav>
 
           {view === 'chat' && (
@@ -323,6 +558,12 @@ export default function App() {
                 <input value={input} onChange={(e) => setInput(e.target.value)}
                        onKeyDown={(e) => e.key === 'Enter' && send()}
                        placeholder="Send a prompt…" disabled={!connected} />
+                {hasSpeech && (
+                  <button className={'mic-btn' + (listening ? ' listening' : '')} onClick={toggleListening}
+                          disabled={!connected} aria-label={listening ? 'Stop recording' : 'Start voice input'}>
+                    {listening ? <span className="mic-dot" /> : '🎤'}
+                  </button>
+                )}
                 <button onClick={send} disabled={!connected || !input.trim()}>Send</button>
               </div>
             </>
@@ -341,6 +582,41 @@ export default function App() {
                   </span>
                 ))}
               </div>
+
+              <div className="search-bar">
+                <input
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') searchFiles();
+                    if (e.key === 'Escape' && searchQuery) clearSearch();
+                  }}
+                  placeholder="Search files…"
+                />
+                {searchQuery && (
+                  <button className="search-cancel" onClick={clearSearch}>✕</button>
+                )}
+              </div>
+
+              {searchResults !== null ? (
+                <div className="search-results">
+                  {searchPending ? (
+                    <div className="file-loading">Searching…</div>
+                  ) : searchResults.length === 0 ? (
+                    <div className="file-empty">No results</div>
+                  ) : (
+                    <>
+                      <div className="search-summary">{searchTotal} result{searchTotal !== 1 ? 's' : ''}</div>
+                      {searchResults.map((r, i) => (
+                        <div key={i} className="search-result-item" onClick={() => openSearchResult(r.path)}>
+                          <span className="search-result-path">{r.path}:{r.line}</span>
+                          <span className="search-result-content">{r.content}</span>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              ) : null}
 
               {fileError && <div className="file-error">{fileError}</div>}
 
@@ -384,6 +660,8 @@ export default function App() {
 
                 {loading && !editing ? (
                   <div className="file-loading">Loading…</div>
+                ) : requestingApproval ? (
+                  <div className="file-loading">Requesting approval…</div>
                 ) : editing ? (
                   <textarea
                     className="edit-area"
@@ -399,8 +677,8 @@ export default function App() {
               {editing && (
                 <div className="input-bar">
                   <span className="file-context">{fileViewPath}</span>
-                  <button onClick={saveFile} disabled={loading || editContent === fileContent}>
-                    {loading ? 'Saving…' : 'Save'}
+                  <button onClick={saveFile} disabled={loading || requestingApproval || editContent === fileContent}>
+                    {loading ? 'Saving…' : requestingApproval ? 'Approval…' : 'Save'}
                   </button>
                 </div>
               )}
@@ -530,8 +808,69 @@ export default function App() {
               </div>
             </>
           )}
+
+          {view === 'history' && (
+            <div className="session-list">
+              {sessionsLoading ? (
+                <div className="file-loading">Loading…</div>
+              ) : sessions.length === 0 ? (
+                <div className="file-empty">No session history</div>
+              ) : (
+                sessions.map(s => (
+                  <div key={s.sessionId} className="session-card">
+                    <div className="session-card-header">
+                      <span className="session-project">{s.project}</span>
+                      {s.disconnectedAt === null && <span className="session-active-dot" />}
+                    </div>
+                    <div className="session-card-detail">
+                      <span>Connected {relativeTime(s.connectedAt)}</span>
+                      {s.disconnectedAt ? (
+                        <span> · {formatDuration(s.connectedAt, s.disconnectedAt)}</span>
+                      ) : (
+                        <span className="session-active-label"> · active</span>
+                      )}
+                    </div>
+                    <div className="session-card-detail">
+                      <span>{s.commandCount} command{s.commandCount !== 1 ? 's' : ''}</span>
+                    </div>
+                    {s.disconnectedAt === null && (
+                      <button className="session-resume-btn" onClick={() => {
+                        // ponytail: only works if session is still in store
+                        setToken(s.sessionId);
+                        connect(true);
+                      }}>Resume</button>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </>
       )}
+
+      {pendingApproval && (
+        <div className="approval-overlay">
+          <div className="approval-dialog">
+            <h3>File Modification Requested</h3>
+            <div className="approval-path">{pendingApproval.path}</div>
+            <div className="approval-meta">{formatSize(pendingApproval.size)} · {new Date(pendingApproval.timestamp).toLocaleString()}</div>
+            <div className="approval-buttons">
+              <button className="approve-btn" onClick={() => handleApproval(true)} disabled={approvalWaiting}>Approve</button>
+              <button className="reject-btn" onClick={() => handleApproval(false)} disabled={approvalWaiting}>Reject</button>
+            </div>
+            {approvalWaiting && <div className="approval-waiting">Waiting for server…</div>}
+          </div>
+        </div>
+      )}
+
+      <div className="toast-container">
+        {notifications.map(n => (
+          <div key={n.id} className={'toast toast-' + n.type}>
+            <span className="toast-msg">{n.message}</span>
+            <button className="toast-close" onClick={() => setNotifications(prev => prev.filter(x => x.id !== n.id))}>✕</button>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
